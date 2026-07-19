@@ -114,6 +114,15 @@ app.get("/alert", (req, res) => {
   res.json({ message: row ? row.message : null });
 });
 
+// Ruta temporal de diagnóstico - la borramos después de usarla
+app.get("/debug/videos-count", (req, res) => {
+  const count = db.prepare("SELECT COUNT(*) as total FROM videos").get();
+  const rows = db
+    .prepare("SELECT id, owner, created_at FROM videos ORDER BY created_at DESC")
+    .all();
+  res.json({ total: count.total, rows });
+});
+
 app.post("/admin/login", (req, res) => {
   const { password } = req.body;
   if (password === process.env.ADMIN_PASSWORD) {
