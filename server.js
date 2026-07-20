@@ -35,7 +35,19 @@ db.exec(`
   );
 `);
 
-const upload = multer({ storage: multer.memoryStorage() });
+try {
+  db.exec("ALTER TABLE videos ADD COLUMN media_type TEXT DEFAULT 'video'");
+} catch (e) {
+  // ya existe, no pasa nada
+}
+
+const MAX_VIDEO_MB = 100;
+const MAX_PHOTO_MB = 10;
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_VIDEO_MB * 1024 * 1024 },
+});
 
 function checkAdmin(req, res, next) {
   const password = req.headers["x-admin-password"];
@@ -49,6 +61,13 @@ function isBlocked(owner) {
   return !!db.prepare("SELECT 1 FROM blocked_users WHERE owner = ?").get(owner);
 }
 
+function noCache(req, res, next) {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  next();
+}
+
 app.post("/videos", upload.single("file"), async (req, res) => {
   try {
     const { owner } = req.body;
@@ -59,36 +78,66 @@ app.post("/videos", upload.single("file"), async (req, res) => {
       return res.status(403).json({ error: "Este usuario está bloqueado" });
     }
 
+    const isPhoto = req.file.mimetype.startsWith("image/");
+    const mediaType = isPhoto ? "photo" : "video";
+    const sizeMB = req.file.size / (1024 * 1024);
+
+    if (isPhoto && sizeMB > MAX_PHOTO_MB) {
+      return res.status(413).json({ error: `Las fotos no pueden superar ${MAX_PHOTO_MB}MB` });
+    }
+    if (!isPhoto && sizeMB > MAX_VIDEO_MB) {
+      return res.status(413).json({ error: `Los videos no pueden superar ${MAX_VIDEO_MB}MB` });
+    }
+
     const result = await new Promise((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
-        { resource_type: "video", folder: "cloudy" },
+        {
+          resource_type: isPhoto ? "image" : "video",
+          folder: "cloudy",
+          quality: "auto:eco",
+          fetch_format: "auto",
+        },
         (err, result) => (err ? reject(err) : resolve(result))
       );
       stream.end(req.file.buffer);
     });
 
     const id = Date.now().toString() + Math.random().toString(36).slice(2);
+    const created_at = Date.now();
     db.prepare(
-      "INSERT INTO videos (id, owner, url, likes, created_at) VALUES (?, ?, ?, 0, ?)"
-    ).run(id, owner, result.secure_url, Date.now());
+      "INSERT INTO videos (id, owner, url, likes, created_at, media_type) VALUES (?, ?, ?, 0, ?, ?)"
+    ).run(id, owner, result.secure_url, created_at, mediaType);
 
-    res.json({ id, owner, url: result.secure_url, likes: 0 });
+    res.json({ id, owner, url: result.secure_url, likes: 0, created_at, media_type: mediaType });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Error subiendo el video" });
+    if (err.message && err.message.includes("File too large")) {
+      return res.status(413).json({ error: `El archivo supera los ${MAX_VIDEO_MB}MB` });
+    }
+    res.status(500).json({ error: "Error subiendo el archivo" });
   }
 });
 
-app.get("/videos", (req, res) => {
+app.get("/videos", noCache, (req, res) => {
   const rows = db
     .prepare(
       `SELECT * FROM videos WHERE owner NOT IN (SELECT owner FROM blocked_users) ORDER BY created_at DESC`
     )
     .all();
-  res.json(rows);
+
+  const withWeights = rows.map((row, index) => {
+    const weight = Math.exp(-index / 15);
+    const score = Math.pow(Math.random(), 1 / weight);
+    return { ...row, _score: score };
+  });
+
+  withWeights.sort((a, b) => b._score - a._score);
+  const shuffled = withWeights.map(({ _score, ...rest }) => rest);
+
+  res.json(shuffled);
 });
 
-app.get("/videos/:owner", (req, res) => {
+app.get("/videos/:owner", noCache, (req, res) => {
   const rows = db
     .prepare("SELECT * FROM videos WHERE owner = ? ORDER BY created_at DESC")
     .all(req.params.owner);
@@ -109,16 +158,15 @@ app.delete("/videos/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/alert", (req, res) => {
+app.get("/alert", noCache, (req, res) => {
   const row = db.prepare("SELECT message FROM current_alert WHERE id = 1").get();
   res.json({ message: row ? row.message : null });
 });
 
-// Ruta temporal de diagnóstico - la borramos después de usarla
 app.get("/debug/videos-count", (req, res) => {
   const count = db.prepare("SELECT COUNT(*) as total FROM videos").get();
   const rows = db
-    .prepare("SELECT id, owner, created_at FROM videos ORDER BY created_at DESC")
+    .prepare("SELECT id, owner, created_at, media_type FROM videos ORDER BY created_at DESC")
     .all();
   res.json({ total: count.total, rows });
 });
@@ -132,12 +180,12 @@ app.post("/admin/login", (req, res) => {
   }
 });
 
-app.get("/admin/videos", checkAdmin, (req, res) => {
+app.get("/admin/videos", checkAdmin, noCache, (req, res) => {
   const rows = db.prepare("SELECT * FROM videos ORDER BY created_at DESC").all();
   res.json(rows);
 });
 
-app.get("/admin/blocked", checkAdmin, (req, res) => {
+app.get("/admin/blocked", checkAdmin, noCache, (req, res) => {
   const rows = db.prepare("SELECT owner, blocked_at FROM blocked_users").all();
   res.json(rows);
 });
